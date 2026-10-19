@@ -1,10 +1,10 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WebServer.h>
-#include "src/MicroRTSP.h"
+#include <ESP32-RTSPServer.h>
 
-const char* ssid     = "Galaxy A12580F";
-const char* password = "isreal13";
+const char* WIFI_SSID = "Galaxy A12580F";
+const char* WIFI_PASSWORD = "isreal13";
 
 // Camera Pin Mapping (AI-Thinker Original Structure)
 #define PWDN_GPIO_NUM     32
@@ -29,8 +29,11 @@ const int RELAY_FAN_S1 = 14;
 const int RELAY_FAN_S2 = 13; 
 const int RELAY_FAN_S3 = 12; 
 
-WiFiServer rtspServer(8554);
+RTSPServer rtspServer;
 WebServer httpServer(80); 
+String currentFanState = "off";
+unsigned long lastReconnectAttempt = 0;
+int frameQuality = 12;
 
 void allFansOff() {
   digitalWrite(RELAY_FAN_S1, LOW);
@@ -45,6 +48,11 @@ void handleFanControl() {
   }
   String state = httpServer.arg("state");
 
+  if (state != "off" && state != "1" && state != "2" && state != "3") {
+    httpServer.send(400, "text/plain", "Invalid fan state");
+    return;
+  }
+
   // Multi-relay safety interlocking check
   allFansOff();
 
@@ -52,7 +60,26 @@ void handleFanControl() {
   else if (state == "2") digitalWrite(RELAY_FAN_S2, HIGH);
   else if (state == "3") digitalWrite(RELAY_FAN_S3, HIGH);
 
-  httpServer.send(200, "text/plain", "Fan Updated Safely");
+  currentFanState = state;
+  httpServer.send(200, "application/json", String("{\"fan\":\"") + currentFanState + "\"}");
+}
+
+void handleStatus() {
+  String json = String("{\"fan\":\"") + currentFanState + "\",\"wifi\":\"" + String(WiFi.status() == WL_CONNECTED ? "connected" : "disconnected") + "\"}";
+  httpServer.send(200, "application/json", json);
+}
+
+void handleHealth() {
+  httpServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void reconnectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (millis() - lastReconnectAttempt < 5000) return;
+
+  lastReconnectAttempt = millis();
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
 void setup() {
@@ -84,36 +111,46 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_SVGA; 
+  // Lower resolution keeps the RTSP stream light enough for real-time gesture detection.
+  config.frame_size = FRAMESIZE_QVGA;
   config.jpeg_quality = 12;
-  config.fb_count = 2;
+  config.fb_count = 1;
 
-  esp_camera_init(&config);
+  esp_err_t cameraStatus = esp_camera_init(&config);
+  if (cameraStatus != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x\n", cameraStatus);
+  }
   sensor_t * s = esp_camera_sensor_get();
-  s->set_vflip(s, 1);
-  s->set_hmirror(s, 1);
+  if (s) {
+    s->set_vflip(s, 1);
+    s->set_hmirror(s, 1);
+    frameQuality = s->status.quality;
+  }
 
-  WiFi.begin(ssid, password);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   while (WiFi.status() != WL_CONNECTED) { delay(500); }
   
-  rtspServer.begin();
+  if (rtspServer.init(RTSPServer::VIDEO_ONLY, 8554)) {
+    Serial.println("RTSP server started on port 8554");
+  } else {
+    Serial.println("Failed to start RTSP server");
+  }
   httpServer.on("/fan", HTTP_GET, handleFanControl);
+  httpServer.on("/status", HTTP_GET, handleStatus);
+  httpServer.on("/health", HTTP_GET, handleHealth);
   httpServer.begin();
 }
 
 void loop() {
+  reconnectWiFi();
   httpServer.handleClient(); 
   
-  WiFiClient client = rtspServer.available();
-  if (client) {
-    MicroRTSP rtspSession(&client);
-    while (client.connected()) {
-      httpServer.handleClient(); 
-      camera_fb_t * fb = esp_camera_fb_get();
-      if (!fb) continue;
-      rtspSession.writeFrame(fb->buf, fb->len);
+  if (rtspServer.readyToSendFrame()) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (fb) {
+      rtspServer.sendRTSPFrame(fb->buf, fb->len, frameQuality, fb->width, fb->height);
       esp_camera_fb_return(fb);
-      delay(1); 
     }
   }
+  delay(1); 
 }
